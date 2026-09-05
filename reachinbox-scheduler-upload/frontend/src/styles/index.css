@@ -1,0 +1,32 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-ink-950 text-mist-50 font-display antialiased;
+}
+
+::selection {
+  background: #3d4a85;
+}
+
+/* Visible keyboard focus ring, respecting the design's accent color. */
+:focus-visible {
+  outline: 2px solid #6c8cff;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

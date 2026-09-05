@@ -1,0 +1,63 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             String   @id @default(uuid())
+  googleId       String   @unique
+  name           String
+  email          String   @unique
+  avatarUrl      String?
+  slackWebhookUrl String?
+  slackTeamName   String?
+  createdAt      DateTime @default(now())
+
+  batches EmailBatch[]
+}
+
+/// One row per "Compose & Schedule" submission — groups the recipients that were
+/// scheduled together so the dashboard can show them, even though each recipient
+/// is its own independent BullMQ job under the hood.
+model EmailBatch {
+  id              String   @id @default(uuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id])
+  subject         String
+  body            String
+  senderEmail     String
+  startTime       DateTime
+  delayMs         Int
+  hourlyLimit     Int
+  createdAt       DateTime @default(now())
+
+  jobs EmailJob[]
+}
+
+/// One row per recipient email — the source of truth for status, read by the
+/// worker for idempotency checks and by the dashboard for the tables.
+model EmailJob {
+  id           String      @id @default(uuid())
+  batchId      String
+  batch        EmailBatch  @relation(fields: [batchId], references: [id])
+  toEmail      String
+  subject      String
+  body         String
+  senderEmail  String
+  scheduledAt  DateTime
+  status       String      @default("SCHEDULED")
+  attempts     Int         @default(0)
+  sentAt       DateTime?
+  previewUrl   String?
+  errorMessage String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  @@index([status])
+  @@index([senderEmail])
+  @@index([toEmail])
+}
