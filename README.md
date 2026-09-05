@@ -4,248 +4,153 @@ A production-shaped email scheduling platform featuring time-delayed queue proce
 
 ---
 
-## 📐 System Architecture & Workflow
+## 🛠️ 1. How to Run the Project
 
-```
-┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
-│ React Dashboard │ ────> │ Express API     │ ────> │ Prisma Database │
-│ (Port 5173)     │       │ (Port 4000)     │       │ (SQLite/Postgres)│
-└─────────────────┘       └────────┬────────┘       └─────────────────┘
-                                   │
-                                   ▼
-                          ┌─────────────────┐
-                          │ BullMQ + Redis  │
-                          │ Delayed Queue   │
-                          └────────┬────────┘
-                                   │
-                                   ▼
-                          ┌─────────────────┐
-                          │ Worker Process  │
-                          └────────┬────────┘
-                                   │
-                 ┌─────────────────┴─────────────────┐
-                 ▼                                   ▼
-     ┌───────────────────────┐           ┌───────────────────────┐
-     │ Ethereal SMTP Mailer  │           │ Slack Alert Webhook   │
-     │ (Preview Links)       │           │ (Rate Limit Hits)     │
-     └───────────────────────┘           └───────────────────────┘
-```
-
-### Key Architectural Concepts
-
-1. **No-Cron Queue Scheduling**: Schedules individual delayed jobs into **BullMQ** backed by **Redis** (`zset` timestamp ordering). Jobs survive process crashes and restarts without depending on Node.js `setTimeout`.
-2. **2-Layer Idempotency**:
-   - *Layer 1 (Queue level)*: Deterministic `jobId` set to the Postgres/SQLite primary key (`EmailJob.id`). BullMQ ignores duplicate job additions.
-   - *Layer 2 (Worker level)*: Worker re-verifies job status in the database before sending. If status is already `SENT`, execution exits silently.
-3. **Atomic Rate Limiting**: Redis fixed-window counters incremented via atomic Lua scripts (`INCR` + `EXPIRE`). Jobs exceeding per-sender hourly limits are deferred (`moveToDelayed`) to the start of the next hourly window without dropping or failing.
-4. **Slack Webhook Alerts**: Automatically triggers live Slack notifications when a sender's rate limit boundary is reached.
-5. **Ethereal SMTP Engine**: Creates throwaway SMTP test accounts on boot, outputting clickable HTML preview URLs for every delivered email.
+### 1.1 Prerequisites
+- **Node.js**: v20.0.0 or higher ([Download Node.js](https://nodejs.org))
+- **npm**: v10.0.0 or higher (included with Node.js)
 
 ---
 
-## 🛠️ Prerequisites & Installation Requirements
+### 1.2 How to Run Backend (Express, Redis, DB, BullMQ Worker)
 
-Before getting started, make sure you have installed:
+Open PowerShell or CMD in the project root:
 
-- **Node.js** (v20.0.0 or higher recommended): [Download Node.js](https://nodejs.org)
-- **npm** (v10.0.0 or higher): Bundled with Node.js
-- **Git** (optional, for version control): [Download Git](https://git-scm.com)
+```powershell
+cd backend
+
+# 1. Install dependencies
+npm install
+
+# 2. Sync database schema (SQLite / PostgreSQL)
+npx prisma db push
+
+# 3. Start API server and in-process BullMQ worker
+npm run dev
+```
+
+The backend starts at **`http://localhost:4000`**.
+
+> **Note on Redis**: The backend automatically detects if a local Redis server is active. If Redis is not running on port 6379, it automatically boots an embedded in-memory Redis instance (`redis-memory-server`) so BullMQ operates out of the box without manual Docker setup.
+
+#### Running Worker in a Separate Process (Production Setup)
+To run the BullMQ worker as an isolated process (closer to a production pod architecture):
+```powershell
+npm run worker
+```
 
 ---
 
-## ⚙️ Environment Configuration
+### 1.3 How to Run Frontend
 
-The backend is configured via `.env` in the `backend/` directory:
+Open a **new** PowerShell or CMD terminal:
+
+```powershell
+cd frontend
+
+# 1. Install dependencies
+npm install
+
+# 2. Start Vite development server
+npm run dev
+```
+
+The React dashboard starts at **`http://localhost:5173`**.
+
+---
+
+### 1.4 Setting Up Ethereal Email & Environment Variables
+
+#### Ethereal Email Setup
+- **Auto-Generation (Default)**: On boot, the backend automatically executes `nodemailer.createTestAccount()` if `SMTP_USER` and `SMTP_PASS` are left empty. Generated temporary credentials and preview links are logged to the console.
+- **Pinned Account (Optional)**: To pin a persistent Ethereal inbox across restarts:
+  1. Visit [https://ethereal.email/create](https://ethereal.email/create) and create a free test account.
+  2. Copy `Account Username` and `Password`.
+  3. Set `SMTP_USER` and `SMTP_PASS` in `backend/.env`.
+
+#### Environment Variables (`backend/.env`)
 
 ```env
-# Server Configuration
+# --- Server ---
 PORT=4000
 FRONTEND_URL=http://localhost:5173
 SESSION_SECRET=reachinbox-dev-secret-key-123456789
 
-# Database & Queue Connections
+# --- Database & Redis ---
 DATABASE_URL="file:./dev.db"
 REDIS_URL="redis://127.0.0.1:6379"
 
-# Queue Pacing & Rate Limits
+# --- Queue & Rate Limiting ---
 WORKER_CONCURRENCY=5
 MIN_SEND_DELAY_MS=2000
 MAX_EMAILS_PER_HOUR_PER_SENDER=200
 
-# Ethereal SMTP (Leave blank to auto-generate)
+# --- Ethereal SMTP Mailer ---
 SMTP_HOST=smtp.ethereal.email
 SMTP_PORT=587
 SMTP_USER=
 SMTP_PASS=
 
-# Google OAuth (Optional)
+# --- Google OAuth (Optional - Demo fallback active if empty) ---
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
 GOOGLE_CALLBACK_URL=http://localhost:4000/api/auth/google/callback
 
-# Slack OAuth (Optional)
+# --- Slack OAuth (Optional) ---
 SLACK_CLIENT_ID=
 SLACK_CLIENT_SECRET=
 SLACK_REDIRECT_URL=http://localhost:4000/api/slack/oauth/callback
+
+# --- Elasticsearch (Optional - Postgres ILIKE fallback active if empty) ---
+ELASTICSEARCH_URL=
 ```
 
 ---
 
-## 🚀 Step-by-Step Execution Guide
+## 📐 2. Architecture Overview
 
-### 1. Setup & Launch Backend Server (Terminal 1)
+### 2.1 How Scheduling Works (No Cron)
+- `POST /api/emails/schedule` receives a batch request, creates an `EmailBatch` record and one `EmailJob` row per recipient in the database with status `SCHEDULED`.
+- Each recipient job is added to the BullMQ delayed queue (`queue.add(name, data, { delay, jobId })`).
+- Recipient $N$ is scheduled at `startTime + (N * delayMs)`, guaranteeing deterministic send pacing.
+- Delays are stored as Redis `zset` timestamp entries. Node `setTimeout` is **not** used.
 
-1. Open PowerShell or Command Prompt in the repository root directory.
-2. Navigate to the backend directory:
-   ```powershell
-   cd backend
-   ```
-3. Install backend packages:
-   ```powershell
-   npm install
-   ```
-4. Push Prisma schema to initialize the database:
-   ```powershell
-   npx prisma db push
-   ```
-5. Start the API server and worker process:
-   ```powershell
-   npm run dev
-   ```
-   *The server will start listening at `http://localhost:4000` and automatically initialize embedded Redis if a local Redis instance is not present.*
+### 2.2 How Persistence on Restart is Handled
+- **Redis Queue State**: BullMQ delayed and waiting jobs live in Redis memory/disk persistence. Stopping or restarting Node.js processes leaves delayed jobs intact.
+- **2-Layer Idempotency**:
+  - *Layer 1 (Queue Level)*: `jobId` is set to the primary key UUID (`EmailJob.id`). BullMQ deduplicates additions with identical `jobId`.
+  - *Layer 2 (Worker Level)*: Before invoking Nodemailer, the worker queries `EmailJob` status in the database. If status is already `SENT`, the handler exits immediately.
+- **Worker Recovery**: BullMQ lock timers detect mid-flight worker crashes and return active stalled jobs to `waiting`.
+- **Database Reconciliation**: A reconciliation script (`npm run reconcile`) scans for `SCHEDULED` DB records missing from Redis and re-enqueues them.
 
----
-
-### 2. Setup & Launch Frontend Dashboard (Terminal 2)
-
-1. Open a **new** PowerShell or Command Prompt window.
-2. Navigate to the frontend directory:
-   ```powershell
-   cd frontend
-   ```
-3. Install frontend packages:
-   ```powershell
-   npm install
-   ```
-4. Start the Vite React development server:
-   ```powershell
-   npm run dev
-   ```
-   *The frontend dashboard will start listening at `http://localhost:5173`.*
+### 2.3 How Rate Limiting & Concurrency are Implemented
+- **Concurrency**: `WORKER_CONCURRENCY` (default `5`) controls maximum simultaneous jobs processed per worker process.
+- **Minimum Pacing Delay**: `MIN_SEND_DELAY_MS` (default `2000`ms) is enforced across workers via BullMQ's queue rate limiter (`limiter: { max: 1, duration: MIN_SEND_DELAY_MS }`).
+- **Per-Sender Hourly Rate Limiting**: Fixed-window Redis counter (`ratelimit:{senderEmail}:{hourBucket}`) evaluated via an **atomic Lua script**. If the limit is exceeded:
+  - The job is updated to `DEFERRED` in the database.
+  - The worker calls `job.moveToDelayed(nextHourBoundary, token)`, pushing the job to the next hour without dropping it or failing.
+  - A real-time notification is posted to the sender's configured Slack Webhook URL.
 
 ---
 
-## 📋 Comprehensive Command Matrix
+## ✨ 3. List of Features Implemented
 
-| Target | Purpose | Exact Command |
-| :--- | :--- | :--- |
-| **Backend** | Navigate to folder | `cd backend` |
-| **Backend** | Install dependencies | `npm install` |
-| **Backend** | Sync Prisma database schema | `npx prisma db push` |
-| **Backend** | Start API & queue worker | `npm run dev` |
-| **Backend** | Run worker in separate process | `npm run worker` |
-| **Backend** | Run queue reconciliation | `npm run reconcile` |
-| **Backend** | Typecheck code | `npm run typecheck` |
-| **Frontend**| Navigate to folder | `cd frontend` |
-| **Frontend**| Install dependencies | `npm install` |
-| **Frontend**| Start React dashboard | `npm run dev` |
-| **Frontend**| Build for production | `npm run build` |
+### ⚙️ Backend Features
+- [x] **Email Scheduling API** (`POST /api/emails/schedule`): Supports CSV/manual recipient list submission.
+- [x] **BullMQ Delayed Queue**: Cron-free scheduling backed by Redis.
+- [x] **Restart Survival**: Persistent queues, database idempotency checks, and a reconciliation script (`npm run reconcile`).
+- [x] **Configurable Worker Concurrency**: Managed via `WORKER_CONCURRENCY`.
+- [x] **Per-Sender Hourly Rate Limiter**: Atomic Redis Lua script counter with automatic hour-boundary deferral (`moveToDelayed`).
+- [x] **Slack Webhook Notifications**: Triggers live Slack alerts on rate-limit hits.
+- [x] **Ethereal SMTP Integration**: Auto-generates test accounts and records HTML preview URLs.
+- [x] **Elasticsearch Integration**: Full-text search with automatic Postgres ILIKE fallback.
+- [x] **Live Bull Board UI**: Queue dashboard hosted at `/admin/queues`.
+- [x] **Authentication & Demo Fallback**: Passport Google OAuth with automatic dev demo account fallback when credentials are not configured.
 
----
-
-## 📖 Feature & Operations Walkthrough
-
-### 1. User Sign-In & Authentication
-- Open `http://localhost:5173`.
-- Click **"Continue with Google"**. If Google OAuth keys are not configured in `.env`, the system safely falls back to a development demo account (`demo@reachinbox.com`), allowing immediate dashboard access.
-
-### 2. Scheduling Email Batches
-- Navigate to **Compose & Schedule**.
-- Fill in:
-  - **Sender Email**: e.g. `marketing@company.com`
-  - **Subject**: Email subject line
-  - **Body**: Plain text or HTML content
-  - **Recipients**: Comma-separated or line-separated email list
-  - **Send Delay (ms)**: Pacing interval between sends (e.g. `2000`ms)
-  - **Hourly Cap**: Maximum sends allowed per hour (e.g. `200`)
-- Click **Schedule Emails**.
-- Recipient $N$ is scheduled at `startTime + (N * delayMs)`.
-
-### 3. Monitoring Queues via Bull Board
-- Open **`http://localhost:4000/admin/queues`** in your browser.
-- Inspect active, waiting, delayed, completed, and failed jobs in real-time.
-
-### 4. Viewing Sent Emails & Preview Links
-- Navigate to the **Sent Emails** tab in the dashboard.
-- Click the **Ethereal Preview URL** link on any delivered email row to view the rendered message as it would appear in the recipient's inbox.
-
----
-
-## 🔌 API Reference
-
-### `POST /api/emails/schedule`
-Schedules a batch of emails.
-
-**Headers**:
-`Content-Type: application/json`
-
-**Body**:
-```json
-{
-  "subject": "Product Announcement",
-  "body": "Check out our new features!",
-  "senderEmail": "sender@company.com",
-  "recipients": ["user1@example.com", "user2@example.com"],
-  "startTime": "2026-09-05T10:00:00.000Z",
-  "delayMs": 2000,
-  "hourlyLimit": 200
-}
-```
-
-**Response (201 Created)**:
-```json
-{
-  "batchId": "ade2a410-a263-4086-a7d4-18ddb1065b55",
-  "scheduledCount": 2
-}
-```
-
----
-
-### `GET /api/emails/scheduled`
-Returns list of currently scheduled or deferred email jobs for the logged-in user.
-
----
-
-### `GET /api/emails/sent`
-Returns list of completed or failed email jobs for the logged-in user including `previewUrl` links.
-
----
-
-### `GET /health`
-Server health check.
-
-**Response (200 OK)**:
-```json
-{
-  "ok": true
-}
-```
-
----
-
-## ❓ Troubleshooting & FAQs
-
-### Q: Server returns `EADDRINUSE: address already in use :::4000`
-Another process is already using port 4000. Stop existing Node processes via Task Manager or run:
-```powershell
-Stop-Process -Name node -Force
-```
-
-### Q: `ECONNREFUSED` on port 6379
-The backend automatically detects if Redis is not running and starts an embedded in-memory Redis instance (`redis-memory-server`) automatically on boot.
-
-### Q: How do I test rate-limiting Slack notifications?
-1. Connect a Slack Webhook URL under Slack Settings in the dashboard.
-2. Schedule a batch exceeding your configured `MAX_EMAILS_PER_HOUR_PER_SENDER` (e.g. 10 emails with limit set to 5).
-3. The remaining 5 jobs will automatically defer to the next hour and trigger a Slack notification to your webhook.
+### 🖥️ Frontend Features
+- [x] **Authentication Page**: Google Sign-In with automatic development mode demo login.
+- [x] **Navigation & Dashboard**: Overview stats showing total scheduled, sent, deferred, and failed jobs.
+- [x] **Compose & Schedule Form**: Interactive form with recipient list input, send delay, and hourly rate limit sliders/fields.
+- [x] **Scheduled & Deferred Table**: Live status table listing pending and rate-limit deferred email jobs.
+- [x] **Sent Emails Table**: Historical table of sent jobs with clickable **Ethereal Preview URL** links.
+- [x] **Slack Webhook Integration UI**: OAuth flow trigger and direct Slack webhook connection.
